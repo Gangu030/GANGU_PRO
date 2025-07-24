@@ -346,7 +346,6 @@ if __name__ == "__main__":
     except Exception as e:
         logging.critical(f"An unhandled error occurred: {e}", exc_info=True)
 
-~/workspace/GANGU_PRO$ cat requirements.txt
 fyers-apiv3==3.0.0 # Specify a version to prevent breaking changes
 flask
 pytz
