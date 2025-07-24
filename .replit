@@ -1,0 +1,33 @@
+# .replit
+# For a Python project, we usually use 'python' as the run command.
+# For Streamlit, we run 'streamlit run dashboard/app.py'.
+# We need both. We can run the main trading logic in the background
+# and then launch Streamlit.
+
+# This tells Replit how to run your project.
+# It uses a specific Python interpreter.
+run = "echo Hello from Replit"
+
+# Define entrypoint for the primary application logic
+entrypoint = "main.py"
+
+# Language and environment setup
+language = "python"
+# The 'modules' key is important for setting up the Python environment.
+# 'python-3.10:v2-20230101' specifies a Python 3.10 environment.
+modules = ["python-3.10:v2-20230101"]
+
+# Configure environment variables (optional, but good practice for secrets)
+# env = {
+#     "FYERS_APP_ID": "your_fyers_app_id",
+#     "FYERS_SECRET_KEY": "your_fyers_secret_key",
+#     "FYERS_REDIRECT_URI": "your_fyers_redirect_uri",
+#     "TELEGRAM_BOT_TOKEN": "your_telegram_bot_token",
+#     "TELEGRAM_CHAT_ID": "your_telegram_chat_id"
+# }
+
+# For web projects, specify port and host
+[deployment]
+# You might need to adjust the port if Streamlit changes its default or if you have conflicts
+port = 8501
+# host = "0.0.0.0" # Usually not needed for Replit, it handles routing

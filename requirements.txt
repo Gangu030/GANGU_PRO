@@ -1,0 +1,10 @@
+fyers-apiv3==3.0.0 # Specify a version to prevent breaking changes
+streamlit
+python-dotenv
+websockets
+asyncio
+requests
+pandas
+numpy
+ta # Pandas TA
+python-telegram-bot==20.3 # Specify a version
