@@ -1,398 +1,339 @@
 import os
-import json
-import logging
 import asyncio
+import logging
 from datetime import datetime, time, timedelta
-from fyers_apiv3.fyersModel import FyersModel
-from fyers_apiv3.FyersWebsocket import data_ws
+import pytz
+from threading import Thread
+from flask import Flask
+import json
 
-from keep_alive import keep_alive
+# Fyers API imports (ensure fyers-api is installed via requirements.txt)
+try:
+    from fyers_api import fyersModel
+    from fyers_api.fyers_ws import FyersSocket
+except ImportError:
+    print(
+        "Fyers API libraries not found. Please ensure 'fyers-api' is installed."
+    )
+    print("You might need to run: pip install fyers-api")
+    exit(1)
 
-# --- Configuration ---
-AUTH_CODE_FILE = "fyers_token.json"  # Still kept for local development/fallback
-LOGS_DIR = "logs"
+# --- Configuration & Global Variables ---
+# Configure logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Define the instruments you want to subscribe to
-SYMBOLS_TO_SUBSCRIBE = ["NSE:SBIN-EQ", "NSE:RELIANCE-EQ"]
+# Load environment variables
+FYERS_APP_ID = os.environ.get('FYERS_APP_ID')
+FYERS_ACCESS_TOKEN = os.environ.get('FYERS_ACCESS_TOKEN')
+FYERS_SECRET_KEY = os.environ.get(
+    'FYERS_SECRET_KEY')  # Usually not directly used in bot, but good to have
 
-# Strategy Parameters
-SHORT_SMA_PERIOD = 5
-LONG_SMA_PERIOD = 20
-CANDLE_HISTORY_LIMIT = max(SHORT_SMA_PERIOD, LONG_SMA_PERIOD) + 5
+# Ensure essential environment variables are set
+if not FYERS_APP_ID or not FYERS_ACCESS_TOKEN or not FYERS_SECRET_KEY:
+    logging.error(
+        "Missing one or more Fyers environment variables (FYERS_APP_ID, FYERS_ACCESS_TOKEN, FYERS_SECRET_KEY). Please set them."
+    )
+    exit(1)
+else:
+    logging.info("Fyers environment variables loaded.")
+    logging.info("FYERS_ACCESS_TOKEN loaded from environment variable.")
 
-# NEW: Trading Parameters
-TRADE_QUANTITY = 1  # Example quantity - Adjust based on your capital and risk
-TARGET_PERCENTAGE = 0.5  # 0.5% target profit
-STOP_LOSS_PERCENTAGE = 0.25  # 0.25% stop loss
-TRAILING_SL_POINTS = 0.1  # Example: 0.1 Rupee trailing stop loss (adjust based on tick size and price)
-
-# Global variables
-fyers_ws_client = None
-live_candles = {}
-completed_candle_history = {symbol: [] for symbol in SYMBOLS_TO_SUBSCRIBE}
-
-# NEW: Track current positions (simple in-memory tracker)
-# Structure: { "SYMBOL": {"side": "BUY" or "SELL", "quantity": QTY, "entry_price": PRICE} }
-current_positions = {}
-
-# FyersModel instance for REST API calls (will be initialized in main)
+# Global FyersModel instance
 fyers_rest_client = None
 
-# --- Logging Setup ---
-if not os.path.exists(LOGS_DIR):
-    os.makedirs(LOGS_DIR)
+# Global WebSocket client instance and data storage
+fyers_ws_client = None
+live_candles = {}  # Stores the latest 1-minute candle data for each symbol
+completed_candle_history = {
+}  # Stores completed 1-minute candles for SMA calculation
+CANDLE_HISTORY_LIMIT = 200  # Number of 1-minute candles to keep for SMA calculation
+SMA_FAST_PERIOD = 9
+SMA_SLOW_PERIOD = 21
 
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s',
-                    handlers=[
-                        logging.FileHandler(
-                            os.path.join(LOGS_DIR, "main_app.log")),
-                        logging.StreamHandler()
-                    ])
-
-
-# --- Token Loading Function ---
-def get_saved_access_token():
-    """Loads the Fyers access token from the saved file (for local fallback)."""
-    if os.path.exists(AUTH_CODE_FILE):
-        try:
-            with open(AUTH_CODE_FILE, 'r') as f:
-                token_data = json.load(f)
-                access_token = token_data.get("access_token")
-                if access_token:
-                    logging.info(
-                        "Successfully loaded Fyers access token from file.")
-                    return access_token
-        except json.JSONDecodeError:
-            logging.error(
-                f"Error decoding {AUTH_CODE_FILE}. Token file might be corrupted."
-            )
-        except Exception as e:
-            logging.error(
-                f"An unexpected error occurred while reading token file: {e}")
-    logging.warning(
-        f"Fyers access token file ({AUTH_CODE_FILE}) not found or could not be loaded."
-    )
-    return None
+# --- Flask Keep-Alive Server ---
+app = Flask(__name__)
 
 
-# --- WebSocket Callback Functions ---
+@app.route('/')
+def home():
+    return "Fyers Trading Bot is running and keeping connection alive!"
 
 
-def on_open():
-    """Called when the WebSocket connection is established."""
-    logging.info(
-        "WebSocket connection established. Subscribing to instruments...")
-    if fyers_ws_client:
-        fyers_ws_client.subscribe(symbols=SYMBOLS_TO_SUBSCRIBE,
-                                  data_type="MarketData")
-        logging.info(f"Subscribed to: {SYMBOLS_TO_SUBSCRIBE} for MarketData.")
-    else:
-        logging.error(
-            "Fyers WebSocket client not initialized in on_open callback.")
+def run_keep_alive():
+    logging.info("Keep-alive web server started.")
+    app.run(host='0.0.0.0', port=8080, debug=False)
 
 
-def on_message(message):
-    """
-    Called when a new message (market data) is received.
-    Processes the tick data and updates live 1-minute candles.
-    """
-    try:
-        if isinstance(message, list):
-            for data_item in message:
-                process_market_data(data_item)
-        elif isinstance(message, dict):
-            process_market_data(message)
-    except Exception as e:
-        logging.error(f"Error processing WebSocket message: {e}")
+# --- Fyers WebSocket Callbacks ---
 
 
-def process_market_data(data_item):
-    """Helper function to process individual market data items."""
+def onmessage(message):
     global live_candles
+    # logging.info(f"Raw WebSocket Message: {message}") # Uncomment for raw message debugging
 
-    if data_item.get('type') != 'df':
-        logging.debug(
-            f"Skipping non-data message: {data_item.get('type')} - {data_item.get('message')}"
-        )
-        return
+    if isinstance(message, dict):
+        if message.get('t') == 'df':  # Data frame message
+            for candle_data in message.get('v', []):
+                symbol = candle_data.get('symbol')
+                if symbol:
+                    # Convert timestamp to IST/UTC datetime object
+                    # Fyers provides timestamp in epoch seconds (IST)
+                    timestamp_ist_epoch = candle_data.get('timestamp')
+                    if timestamp_ist_epoch:
+                        timestamp_utc = datetime.fromtimestamp(
+                            timestamp_ist_epoch,
+                            tz=pytz.timezone('Asia/Kolkata')).astimezone(
+                                pytz.utc)
 
-    symbol = data_item.get("symbol")
-    ltp = data_item.get("ltp")
-    vol_traded_today = data_item.get("vol_traded_today")
-
-    if not symbol or ltp is None:
-        logging.warning(
-            f"Skipping malformed data item (missing symbol/ltp): {data_item}")
-        return
-
-    try:
-        current_ts_epoch = data_item.get("timestamp") or data_item.get(
-            "last_traded_time")
-        if current_ts_epoch:
-            current_time = datetime.fromtimestamp(current_ts_epoch)
+                        # Update the latest 1-minute candle
+                        live_candles[symbol] = {
+                            'timestamp':
+                            timestamp_utc,
+                            'open':
+                            candle_data.get('open'),
+                            'high':
+                            candle_data.get('high'),
+                            'low':
+                            candle_data.get('low'),
+                            'close':
+                            candle_data.get('close'),
+                            'volume':
+                            candle_data.get('vol'),
+                            'cumulative_day_volume':
+                            candle_data.get(
+                                'short_mkt_qty')  # For cumulative day volume
+                        }
+                        # logging.info(f"Updated live candle for {symbol}: {live_candles[symbol]}") # Uncomment to see live candle updates
+        elif message.get('t') == 'error':
+            logging.error(f"WebSocket Error Message: {message.get('msg')}")
+        elif message.get('t') == 'order_update':
+            logging.info(f"Order Update: {message}")
+        elif message.get('t') == 'order_status':
+            logging.info(f"Order Status: {message}")
         else:
-            current_time = datetime.now()
-            logging.warning(
-                f"Timestamp missing for {symbol}, using current time: {current_time}"
-            )
+            logging.info(f"Received WebSocket data: {message}")
+    else:
+        logging.warning(
+            f"Unexpected message type from WebSocket: {type(message)} - {message}"
+        )
 
+
+def onerror(message):
+    logging.error(f"WebSocket Error: {message}")
+
+
+def onopen():
+    logging.info("Websocket connected")
+    # Subscribing to market data for SBIN and RELIANCE
+    data_type = "symbolData"  # "symbolData" for 1-minute candle, "depth" for market depth etc.
+    symbols_to_subscribe = ['NSE:SBIN-EQ', 'NSE:RELIANCE-EQ']
+    # If you want to use the 'token' based format for WebSocket (recommended by Fyers)
+    # The format is 'token':'1,2,3...' where 1,2,3 are Fyers instrument tokens
+    # You'll need to fetch instrument tokens via Fyers API first or hardcode them
+    # For now, let's assume direct symbol string works for symbolData, if not use tokens
+    # Fyers API docs often show symbols as tokens for ws.subscribe. Let's try with symbol name as per docs.
+
+    # For symbolData, usually `data_type` in subscribe is `symbolData`
+    # and `symbols` are a list of instrument tokens.
+    # For simplicity using symbol strings if supported. If not, will need token lookup.
+    # The `fyers-api` library often handles token conversion internally for subscribe with symbol strings.
+    logging.info(
+        f"WebSocket connection established. Subscribing to instruments...")
+    fyers_ws_client.subscribe(symbols=symbols_to_subscribe,
+                              data_type=data_type)
+    logging.info(f"Subscribed to: {symbols_to_subscribe} for {data_type}.")
+
+
+def onclose():
+    logging.info("Websocket connection closed.")
+
+
+# --- Fyers API Initialization ---
+
+
+def authenticate_fyers(app_id, secret_key, access_token):
+    """Initializes and returns the FyersModel client."""
+    try:
+        fyers = fyersModel.FyersModel(
+            client_id=app_id,
+            token=access_token,
+            log_path=os.getcwd()  # Log path set to current working directory
+        )
+        logging.info(
+            "Access Token obtained. Testing REST API (profile fetch)...")
+        profile = fyers.get_profile()
+        if profile and profile.get('s') == 'ok':
+            logging.info("Successfully fetched user profile via REST API.")
+            return fyers
+        else:
+            logging.error(f"Failed to fetch user profile: {profile}")
+            return None
     except Exception as e:
         logging.error(
-            f"Error parsing timestamp for {symbol}: {e}. Data: {data_item}. Using current time."
-        )
-        current_time = datetime.now()
-
-    current_minute_start = current_time.replace(second=0, microsecond=0)
-
-    if symbol not in live_candles or live_candles[symbol][
-            "timestamp"] != current_minute_start:
-        logging.info(
-            f"New 1-minute candle for {symbol} at {current_minute_start.strftime('%H:%M')}"
-        )
-        live_candles[symbol] = {
-            "open": ltp,
-            "high": ltp,
-            "low": ltp,
-            "close": ltp,
-            "volume": 0,
-            "cumulative_day_volume": vol_traded_today,
-            "timestamp": current_minute_start
-        }
-    else:
-        current_candle = live_candles[symbol]
-        current_candle["high"] = max(current_candle["high"], ltp)
-        current_candle["low"] = min(current_candle["low"], ltp)
-        current_candle["close"] = ltp
-        current_candle["cumulative_day_volume"] = vol_traded_today
-
-
-def on_error(error):
-    """Called when a WebSocket error occurs."""
-    logging.error(f"WebSocket Error: {error}")
-
-
-def on_close():
-    """Called when the WebSocket connection is closed."""
-    logging.info("WebSocket connection closed.")
-
-
-async def run_websocket_client(raw_access_token, fyers_app_id):
-    """Initializes and runs the Fyers WebSocket client."""
-    global fyers_ws_client
-
-    websocket_formatted_token = f"{fyers_app_id}:{raw_access_token}"
-    logging.info(
-        f"Using WebSocket token format: {fyers_app_id}:<your_token_starts_here...> (masked for security)"
-    )
-
-    fyers_ws_client = data_ws.FyersDataSocket(
-        access_token=websocket_formatted_token,
-        log_path=LOGS_DIR,
-        litemode=False,
-        write_to_file=False,
-        reconnect=True,
-        on_connect=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close)
-
-    logging.info("Connecting to Fyers WebSocket...")
-    fyers_ws_client.connect()
-
-
-# --- Strategy Related Functions ---
-
-
-def calculate_sma(data_points, period):
-    """Calculates the Simple Moving Average (SMA) for a given period."""
-    if len(data_points) < period:
+            f"Error during Fyers authentication or profile fetch: {e}")
         return None
-    return sum(data_points[-period:]) / period
+
+
+def initialize_fyers_client(access_token):
+    """Initializes and returns the FyersSocket WebSocket client."""
+    try:
+        # FyersSocket requires access_token in a specific format for WebSocket
+        # It's usually FYERS_APP_ID + ":" + ACCESS_TOKEN
+        # This is where your actual access token from the login flow or env var goes
+        # For direct use from env var, ensure it's the complete token
+        ws_token = f"{FYERS_APP_ID}:{access_token}"
+        logging.info(
+            f"Using WebSocket token format: {FYERS_APP_ID}:<your_token_starts_here...> (masked for security)"
+        )
+
+        data_socket = FyersSocket(
+            access_token=ws_token,
+            log_path=os.getcwd(),
+            litemode=False,  # Set to True for Lite mode (only LTP)
+            write_to_file=False,
+            handler_message=onmessage,
+            handler_error=onerror,
+            handler_open=onopen,
+            handler_close=onclose)
+        logging.info("Connecting to Fyers WebSocket...")
+        # Run the WebSocket connection in a separate thread to not block the main async loop
+        Thread(target=data_socket.connect).start()
+        return data_socket
+    except Exception as e:
+        logging.error(f"Error initializing Fyers WebSocket client: {e}")
+        return None
+
+
+# --- Trading Logic (SMA Crossover) ---
+
+
+def calculate_sma(data, period):
+    """Calculates Simple Moving Average."""
+    if len(data) < period:
+        return None
+    return sum(c['close'] for c in data[-period:]) / period
 
 
 def check_sma_crossover(symbol):
-    """
-    Checks for a Simple Moving Average crossover signal.
-    This function assumes completed_candle_history[symbol] is populated with enough candles.
-    """
-    history = completed_candle_history[symbol]
-
-    if len(history) < LONG_SMA_PERIOD:
+    """Checks for SMA crossover signals."""
+    history = completed_candle_history.get(symbol)
+    if not history or len(history) < SMA_SLOW_PERIOD:
         return None
 
-    close_prices = [candle['close'] for candle in history]
+    fast_sma = calculate_sma(history, SMA_FAST_PERIOD)
+    slow_sma = calculate_sma(history, SMA_SLOW_PERIOD)
 
-    short_sma = calculate_sma(close_prices, SHORT_SMA_PERIOD)
-    long_sma = calculate_sma(close_prices, LONG_SMA_PERIOD)
-
-    if short_sma is None or long_sma is None:
+    if fast_sma is None or slow_sma is None:
         return None
 
-    if len(history) < LONG_SMA_PERIOD + 1:
+    # Get previous SMAs for crossover check
+    # Need at least two data points to check crossover
+    if len(
+            history
+    ) < SMA_SLOW_PERIOD + 1:  # Need previous candle for previous SMA calculation
         return None
 
-    prev_close_prices = close_prices[:-1]
-    prev_short_sma = calculate_sma(prev_close_prices, SHORT_SMA_PERIOD)
-    prev_long_sma = calculate_sma(prev_close_prices, LONG_SMA_PERIOD)
+    prev_history = history[:
+                           -1]  # History excluding the very last (current) candle
+    prev_fast_sma = calculate_sma(prev_history, SMA_FAST_PERIOD)
+    prev_slow_sma = calculate_sma(prev_history, SMA_SLOW_PERIOD)
 
-    if prev_short_sma is None or prev_long_sma is None:
+    if prev_fast_sma is None or prev_slow_sma is None:
         return None
 
-    signal = None
-    if short_sma > long_sma and prev_short_sma <= prev_long_sma:
-        signal = "BUY"
-    elif short_sma < long_sma and prev_short_sma >= prev_long_sma:
-        signal = "SELL"
-
-    if signal:
+    if fast_sma > slow_sma and prev_fast_sma <= prev_slow_sma:
         logging.info(
-            f"STRATEGY SIGNAL for {symbol} at {history[-1]['timestamp'].strftime('%H:%M')}: {signal}!"
-            f" (Short SMA: {short_sma:.2f}, Long SMA: {long_sma:.2f})")
-    return signal
-
-
-# NEW: Order Placement Function
-def execute_trade(symbol, signal_type, current_price):
-    """
-    Executes a trade based on the signal using Fyers Bracket Order.
-    This is a simplified example.
-    """
-    global current_positions, fyers_rest_client
-
-    if fyers_rest_client is None:
-        logging.error("Fyers REST client not initialized. Cannot place order.")
-        return
-
-    # Prevent re-entry if already in a position for this symbol
-    if symbol in current_positions:
-        logging.info(
-            f"Already in a {current_positions[symbol]['side']} position for {symbol}. Skipping new entry."
+            f"STRATEGY SIGNAL for {symbol}: BUY (Fast SMA crossed above Slow SMA)"
         )
+        return "BUY"
+    elif fast_sma < slow_sma and prev_fast_sma >= prev_slow_sma:
+        logging.info(
+            f"STRATEGY SIGNAL for {symbol}: SELL (Fast SMA crossed below Slow SMA)"
+        )
+        return "SELL"
+    return None
+
+
+def execute_trade(symbol, signal, price):
+    """
+    Executes a trade based on the signal.
+    This is a placeholder. You need to implement actual order placement using fyers_rest_client.
+    """
+    if not fyers_rest_client:
+        logging.error(
+            "Fyers REST client not initialized. Cannot execute trade.")
         return
 
-    side = 1 if signal_type == "BUY" else -1  # 1 for BUY, -1 for SELL
-
-    sl_points = round(current_price * (STOP_LOSS_PERCENTAGE / 100), 2)
-    tp_points = round(current_price * (TARGET_PERCENTAGE / 100), 2)
-
-    order_data = {
+    # Example: Place a market order
+    # Replace with your actual order parameters (e.g., quantity, product_type, order_type)
+    order_params = {
         "symbol": symbol,
-        "qty": TRADE_QUANTITY if signal_type == "BUY" else
-        -TRADE_QUANTITY,  # Negative quantity for SELL
-        "type": 1,  # 1 for Market Order. Entry leg of BO is often Market.
-        "side": side,
-        "productType": "BO",  # Bracket Order
-        "limitPrice": 0,  # Not applicable for Market entry
-        "stopPrice": 0,  # Not applicable for Market entry
-        "validity": "DAY",  # DAY or IOC
+        "qty": 1,  # Example quantity
+        "type":
+        2,  # 1: Limit Order, 2: Market Order, 3: Stop Order, 4: Stop Limit Order
+        "side": 1 if signal == "BUY" else -1,  # 1: Buy, -1: Sell
+        "productType": "INTRADAY",  # INTRADAY, CNC, MARGIN, CO, BO
+        "limitPrice": 0,
+        "stopPrice": 0,
+        "validity": "DAY",  # DAY, IOC
         "disclosedQty": 0,
         "offlineOrder": False,
-        "price": 0,  # Market order doesn't need price
-        "orderType":
-        1,  # This is the type of the main order leg (1 for MARKET)
-        "stopLoss": sl_points,  # Stop loss in absolute points from entry
-        "takeProfit": tp_points,  # Target profit in absolute points from entry
-        "trailingStopLoss":
-        TRAILING_SL_POINTS  # Trailing SL in absolute points from stopLoss
+        "orderTag": "my_algo_trade"  # Optional tag
     }
 
-    logging.info(
-        f"Attempting to place {signal_type} BO for {symbol} at {current_price} "
-        f"Qty: {order_data['qty']}, SL: {sl_points} points, TP: {tp_points} points, TSL: {TRAILING_SL_POINTS} points."
-    )
-
     try:
-        # Place the order
-        order_response = fyers_rest_client.place_order(data=order_data)
-
-        if order_response and order_response.get("code") == 200:
-            order_id = order_response.get("id")
+        logging.info(
+            f"Attempting to place {signal} order for {symbol} at price {price}..."
+        )
+        response = fyers_rest_client.place_order(data=order_params)
+        if response and response.get('s') == 'ok':
+            order_id = response.get('id')
             logging.info(
-                f"Successfully placed {signal_type} Bracket Order for {symbol}. Order ID: {order_id}"
+                f"Successfully placed {signal} order for {symbol}. Order ID: {order_id}"
             )
-            # Update local position tracker
-            current_positions[symbol] = {
-                "side": signal_type,
-                "quantity": TRADE_QUANTITY,
-                "entry_price": current_price,
-                "order_id": order_id  # Store the main order ID
-            }
+            logging.info(f"Order response: {response}")
         else:
             logging.error(
-                f"Failed to place {signal_type} Bracket Order for {symbol}: {order_response}"
-            )
-
+                f"Failed to place {signal} order for {symbol}: {response}")
     except Exception as e:
-        logging.error(
-            f"An error occurred while placing order for {symbol}: {e}")
+        logging.error(f"Error placing order for {symbol}: {e}")
 
 
-# --- Main Application Logic ---
+# --- Main Bot Logic ---
+
+
 async def main():
-    """Main function to run the application."""
-    keep_alive()
-    logging.info("Keep-alive web server started.")
+    global fyers_rest_client, fyers_ws_client, live_candles, completed_candle_history
 
-    # --- Fetch API Credentials from Environment Variables ---
-    fyers_app_id = os.environ.get("FYERS_APP_ID")
-    fyers_secret_key = os.environ.get("FYERS_SECRET_KEY")
-    fyers_redirect_uri = os.environ.get(
-        "FYERS_REDIRECT_URI"
-    )  # This is likely needed for initial token generation, but not direct use in deployed app
+    # Start the Flask keep-alive server in a separate thread
+    keep_alive_thread = Thread(target=run_keep_alive)
+    keep_alive_thread.daemon = True  # Daemonize thread so it exits when main program exits
+    keep_alive_thread.start()
 
-    # Check for essential Fyers API credentials
-    if not all([fyers_app_id, fyers_secret_key]):
-        logging.error(
-            "Missing essential Fyers API credentials (FYERS_APP_ID or FYERS_SECRET_KEY) in environment variables."
-        )
-        logging.error("Please set these variables on Railway. Exiting.")
-        return  # Exit if critical variables are missing
+    # Authenticate Fyers REST API
+    fyers_rest_client = authenticate_fyers(FYERS_APP_ID, FYERS_SECRET_KEY,
+                                           FYERS_ACCESS_TOKEN)
+    if not fyers_rest_client:
+        logging.error("Failed to initialize Fyers REST client. Exiting.")
+        return
 
-    # --- Prioritize Fyers Access Token from Environment Variable ---
-    access_token = os.environ.get("FYERS_ACCESS_TOKEN")
-    if access_token:
-        logging.info("Fyers access token loaded from environment variable.")
-    else:
-        logging.warning(
-            "FYERS_ACCESS_TOKEN not found in environment variable. Attempting to load from local file (for local testing)."
-        )
-        access_token = get_saved_access_token(
-        )  # Fallback to file for local testing
+    # Initialize Fyers WebSocket client
+    fyers_ws_client = initialize_fyers_client(FYERS_ACCESS_TOKEN)
+    if not fyers_ws_client:
+        logging.error("Failed to initialize Fyers WebSocket client. Exiting.")
+        return
 
-    if not access_token:
-        logging.error(
-            "No Fyers access token available. Please ensure FYERS_ACCESS_TOKEN is set as an environment variable "
-            "on Railway, or generated and saved locally via `python3 -m fyers_api.auth`."
-        )
-        return  # Exit if no access token is found
+    # Initialize candle history for subscribed symbols
+    symbols_to_subscribe = ['NSE:SBIN-EQ', 'NSE:RELIANCE-EQ']
+    for symbol in symbols_to_subscribe:
+        completed_candle_history[symbol] = []
+        live_candles[symbol] = {
+        }  # Initialize empty live candle for each symbol
 
-    logging.info("Access Token obtained. Testing REST API (profile fetch)...")
-    try:
-        global fyers_rest_client  # Declare global to assign to it
-        fyers_rest_client = FyersModel(
-            token=access_token,
-            is_async=False,
-            client_id=fyers_app_id,  # Use the fetched APP_ID
-            log_path=LOGS_DIR)
-        profile_response = fyers_rest_client.get_profile()
-
-        if profile_response and profile_response.get("code") == 200:
-            logging.info("Successfully fetched user profile via REST API.")
-        else:
-            logging.error(
-                f"Failed to fetch user profile via REST API: {profile_response}"
-            )
-
-    except Exception as e:
-        logging.error(f"An error occurred during REST API call: {e}")
-
-    logging.info("Starting WebSocket client for real-time data...")
-    # Pass fyers_app_id to run_websocket_client for token formatting
-    await run_websocket_client(access_token, fyers_app_id)
-
-    # Market timings for NSE (9:15 AM to 3:30 PM IST)
-    # Convert to UTC: 9:15 AM IST = 3:45 AM UTC, 3:30 PM IST = 10:00 AM UTC
+    # Define market hours in UTC (IST is UTC + 5:30)
+    # 9:15 AM IST = 3:45 AM UTC
+    # 3:30 PM IST = 10:00 AM UTC
     market_open_time_utc = time(3, 45, 0)
     market_close_time_utc = time(10, 0, 0)
 
@@ -409,7 +350,11 @@ async def main():
 
             if last_minute_checked is None or current_minute_start > last_minute_checked:
                 for symbol in list(live_candles.keys()):
-                    candle = live_candles[symbol]
+                    candle = live_candles.get(
+                        symbol
+                    )  # Use .get to avoid KeyError if symbol not yet updated
+                    if not candle: continue  # Skip if no live candle data yet
+
                     candle_ts_utc_start = candle["timestamp"].replace(
                         second=0, microsecond=0)
 
@@ -430,8 +375,7 @@ async def main():
 
                         signal = check_sma_crossover(symbol)
                         if signal:
-                            # NEW: Execute the trade when a signal is generated
-                            # Use the last closing price of the just-closed candle as the trigger price
+                            # Execute the trade when a signal is generated
                             current_price_for_trade = candle['close']
                             execute_trade(symbol, signal,
                                           current_price_for_trade)
@@ -445,10 +389,7 @@ async def main():
             logging.info(
                 f"Market close time ({market_close_time_utc.strftime('%H:%M')} UTC) reached. Exiting system."
             )
-            # You might want to square off any open positions here before exiting.
-            if fyers_ws_client:
-               # fyers_ws_client.close()
-                  # Explicitly close WebSocket connection
+            # No explicit close needed for fyers_ws_client as program termination handles it.
             break  # Exit the loop and end the program after market close
 
         else:  # Before market open
@@ -458,11 +399,11 @@ async def main():
             await asyncio.sleep(60)  # Sleep longer if market is closed
 
 
-# This part is removed as the token check is now robust inside main()
-# else:
-#     logging.error(
-#         "No access token available. Please run `python3 -m fyers_api.auth` to generate it first."
-#     )
-
+# --- Main Execution ---
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Bot stopped manually.")
+    except Exception as e:
+        logging.critical(f"An unhandled error occurred: {e}", exc_info=True)
