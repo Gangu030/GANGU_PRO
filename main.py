@@ -447,7 +447,7 @@ async def main():
             )
             # You might want to square off any open positions here before exiting.
             if fyers_ws_client:
-                fyers_ws_client.close(
+               # fyers_ws_client.close(
                 )  # Explicitly close WebSocket connection
             break  # Exit the loop and end the program after market close
 
