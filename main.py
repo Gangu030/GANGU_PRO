@@ -377,8 +377,8 @@ async def main():
 
                 last_minute_checked = current_minute_start
 
-            await asyncio.sleep(0.5
-                                )  # Poll more frequently within market hours
+            await asyncio.sleep(0.5)
+    # Poll more frequently within market hours
 
         elif current_time_utc >= market_close_time_utc:
             logging.info(
