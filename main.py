@@ -5,12 +5,11 @@ import asyncio
 from datetime import datetime, time, timedelta
 from fyers_apiv3.fyersModel import FyersModel
 from fyers_apiv3.FyersWebsocket import data_ws
-from config import FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URI
 
 from keep_alive import keep_alive
 
 # --- Configuration ---
-AUTH_CODE_FILE = "fyers_token.json"
+AUTH_CODE_FILE = "fyers_token.json"  # Still kept for local development/fallback
 LOGS_DIR = "logs"
 
 # Define the instruments you want to subscribe to
@@ -54,14 +53,15 @@ logging.basicConfig(level=logging.INFO,
 
 # --- Token Loading Function ---
 def get_saved_access_token():
-    """Loads the Fyers access token from the saved file."""
+    """Loads the Fyers access token from the saved file (for local fallback)."""
     if os.path.exists(AUTH_CODE_FILE):
         try:
             with open(AUTH_CODE_FILE, 'r') as f:
                 token_data = json.load(f)
                 access_token = token_data.get("access_token")
                 if access_token:
-                    logging.info("Successfully loaded Fyers access token.")
+                    logging.info(
+                        "Successfully loaded Fyers access token from file.")
                     return access_token
         except json.JSONDecodeError:
             logging.error(
@@ -70,7 +70,9 @@ def get_saved_access_token():
         except Exception as e:
             logging.error(
                 f"An unexpected error occurred while reading token file: {e}")
-    logging.warning("Fyers access token not found or could not be loaded.")
+    logging.warning(
+        f"Fyers access token file ({AUTH_CODE_FILE}) not found or could not be loaded."
+    )
     return None
 
 
@@ -164,12 +166,6 @@ def process_market_data(data_item):
         current_candle["close"] = ltp
         current_candle["cumulative_day_volume"] = vol_traded_today
 
-    # logging.info(f"Updated {symbol} 1-min candle: "
-    #              f"O={live_candles[symbol]['open']}, H={live_candles[symbol]['high']}, "
-    #              f"L={live_candles[symbol]['low']}, C={live_candles[symbol]['close']}, "
-    #              f"DailyVol={live_candles[symbol]['cumulative_day_volume']} "
-    #              f"at {current_time.strftime('%H:%M:%S')}")
-
 
 def on_error(error):
     """Called when a WebSocket error occurs."""
@@ -181,13 +177,13 @@ def on_close():
     logging.info("WebSocket connection closed.")
 
 
-async def run_websocket_client(raw_access_token):
+async def run_websocket_client(raw_access_token, fyers_app_id):
     """Initializes and runs the Fyers WebSocket client."""
     global fyers_ws_client
 
-    websocket_formatted_token = f"{FYERS_APP_ID}:{raw_access_token}"
+    websocket_formatted_token = f"{fyers_app_id}:{raw_access_token}"
     logging.info(
-        f"Using WebSocket token format: {FYERS_APP_ID}:<your_token_starts_here...> (masked for security)"
+        f"Using WebSocket token format: {fyers_app_id}:<your_token_starts_here...> (masked for security)"
     )
 
     fyers_ws_client = data_ws.FyersDataSocket(
@@ -277,40 +273,6 @@ def execute_trade(symbol, signal_type, current_price):
 
     side = 1 if signal_type == "BUY" else -1  # 1 for BUY, -1 for SELL
 
-    # Calculate target and stop loss prices
-    target_price = current_price * (
-        1 +
-        TARGET_PERCENTAGE / 100) if signal_type == "BUY" else current_price * (
-            1 - TARGET_PERCENTAGE / 100)
-    stop_loss_price = current_price * (
-        1 - STOP_LOSS_PERCENTAGE / 100
-    ) if signal_type == "BUY" else current_price * (1 +
-                                                    STOP_LOSS_PERCENTAGE / 100)
-
-    # Fyers Bracket Order (BO) parameters
-    # Note: priceType, productType, orderType, etc., are crucial.
-    # Check Fyers API docs for exact parameters. Assuming "MARKET" entry.
-    # For TSL, Fyers often uses `trailingStopLoss` in ticks or points.
-
-    # Adjust target/stop-loss values to be in points/ticks from current price for Fyers API
-    # Assuming `limitPrice` is for target, `stopLoss` is for stop loss points from entry.
-    # Fyers BO requires `stopLoss` and `limitPrice` as absolute values, not points away.
-    # The `price` parameter for the main order is the entry price.
-
-    # Let's use the absolute difference for SL/TP as Fyers typically expects this for BO/CO.
-    # Example: if entry is 100, target 0.5%, target price is 100.5.
-    # Then `stopLoss` (absolute) = 0.25, `limitPrice` (absolute) = 0.5
-    # (assuming `stopLoss` and `limitPrice` in BO order params are the absolute points difference)
-    # This might require careful reading of Fyers API docs for exact interpretation of `stopLoss` and `limitPrice` in BO.
-    # For now, let's assume `stopLoss` and `target` in the order payload are the points relative to the trigger price,
-    # and `trailingStopLoss` is also relative.
-
-    # If using absolute values:
-    # `stopLossPrice` (absolute price where SL is triggered)
-    # `targetPrice` (absolute price where target is hit)
-
-    # Let's use relative points for `stopLoss` and `target` in the order request, as is common for BOs.
-    # For example, if current price is 100, SL 0.25%, then SL points = 0.25. Target points = 0.5.
     sl_points = round(current_price * (STOP_LOSS_PERCENTAGE / 100), 2)
     tp_points = round(current_price * (TARGET_PERCENTAGE / 100), 2)
 
@@ -318,9 +280,7 @@ def execute_trade(symbol, signal_type, current_price):
         "symbol": symbol,
         "qty": TRADE_QUANTITY if signal_type == "BUY" else
         -TRADE_QUANTITY,  # Negative quantity for SELL
-        "type":
-        2,  # 2 for Limit Order, 1 for Market Order. Let's start with MARKET for entry.
-        # For BO, the entry leg can be Market (1), Limit (2), or SL-M (3).
+        "type": 1,  # 1 for Market Order. Entry leg of BO is often Market.
         "side": side,
         "productType": "BO",  # Bracket Order
         "limitPrice": 0,  # Not applicable for Market entry
@@ -344,7 +304,6 @@ def execute_trade(symbol, signal_type, current_price):
 
     try:
         # Place the order
-        # The Fyers place_order method is synchronous by default
         order_response = fyers_rest_client.place_order(data=order_data)
 
         if order_response and order_response.get("code") == 200:
@@ -375,49 +334,76 @@ async def main():
     keep_alive()
     logging.info("Keep-alive web server started.")
 
-    access_token = get_saved_access_token()
+    # --- Fetch API Credentials from Environment Variables ---
+    fyers_app_id = os.environ.get("FYERS_APP_ID")
+    fyers_secret_key = os.environ.get("FYERS_SECRET_KEY")
+    fyers_redirect_uri = os.environ.get(
+        "FYERS_REDIRECT_URI"
+    )  # This is likely needed for initial token generation, but not direct use in deployed app
 
+    # Check for essential Fyers API credentials
+    if not all([fyers_app_id, fyers_secret_key]):
+        logging.error(
+            "Missing essential Fyers API credentials (FYERS_APP_ID or FYERS_SECRET_KEY) in environment variables."
+        )
+        logging.error("Please set these variables on Railway. Exiting.")
+        return  # Exit if critical variables are missing
+
+    # --- Prioritize Fyers Access Token from Environment Variable ---
+    access_token = os.environ.get("FYERS_ACCESS_TOKEN")
     if access_token:
-        logging.info(
-            "Access Token obtained. Testing REST API (profile fetch)...")
-        try:
-            global fyers_rest_client  # Declare global to assign to it
-            fyers_rest_client = FyersModel(token=access_token,
-                                           is_async=False,
-                                           client_id=FYERS_APP_ID,
-                                           log_path=LOGS_DIR)
-            profile_response = fyers_rest_client.get_profile()
+        logging.info("Fyers access token loaded from environment variable.")
+    else:
+        logging.warning(
+            "FYERS_ACCESS_TOKEN not found in environment variable. Attempting to load from local file (for local testing)."
+        )
+        access_token = get_saved_access_token(
+        )  # Fallback to file for local testing
 
-            if profile_response and profile_response.get("code") == 200:
-                logging.info("Successfully fetched user profile via REST API.")
-            else:
-                logging.error(
-                    f"Failed to fetch user profile via REST API: {profile_response}"
-                )
+    if not access_token:
+        logging.error(
+            "No Fyers access token available. Please ensure FYERS_ACCESS_TOKEN is set as an environment variable "
+            "on Railway, or generated and saved locally via `python3 -m fyers_api.auth`."
+        )
+        return  # Exit if no access token is found
 
-        except Exception as e:
-            logging.error(f"An error occurred during REST API call: {e}")
+    logging.info("Access Token obtained. Testing REST API (profile fetch)...")
+    try:
+        global fyers_rest_client  # Declare global to assign to it
+        fyers_rest_client = FyersModel(
+            token=access_token,
+            is_async=False,
+            client_id=fyers_app_id,  # Use the fetched APP_ID
+            log_path=LOGS_DIR)
+        profile_response = fyers_rest_client.get_profile()
 
-        logging.info("Starting WebSocket client for real-time data...")
-        await run_websocket_client(access_token)
+        if profile_response and profile_response.get("code") == 200:
+            logging.info("Successfully fetched user profile via REST API.")
+        else:
+            logging.error(
+                f"Failed to fetch user profile via REST API: {profile_response}"
+            )
 
-        last_minute_checked = None
-        market_close_time_utc = time(10, 0, 0)  # 3:30 PM IST in UTC
+    except Exception as e:
+        logging.error(f"An error occurred during REST API call: {e}")
 
-        while True:
-            current_datetime_utc = datetime.utcnow()
-            current_time_utc = current_datetime_utc.time()
+    logging.info("Starting WebSocket client for real-time data...")
+    # Pass fyers_app_id to run_websocket_client for token formatting
+    await run_websocket_client(access_token, fyers_app_id)
 
-            if current_time_utc >= market_close_time_utc:
-                logging.info(
-                    f"Market close time ({market_close_time_utc.strftime('%H:%M')} UTC) reached. Exiting system."
-                )
-                # You might want to square off any open positions here before exiting.
-                if fyers_ws_client:
-                    # fyers_ws_client.close() # Or a similar method to explicitly close connection
-                    pass
-                break
+    # Market timings for NSE (9:15 AM to 3:30 PM IST)
+    # Convert to UTC: 9:15 AM IST = 3:45 AM UTC, 3:30 PM IST = 10:00 AM UTC
+    market_open_time_utc = time(3, 45, 0)
+    market_close_time_utc = time(10, 0, 0)
 
+    last_minute_checked = None
+
+    while True:
+        current_datetime_utc = datetime.utcnow()
+        current_time_utc = current_datetime_utc.time()
+
+        # Check if within market hours to process candles and trade
+        if market_open_time_utc <= current_time_utc < market_close_time_utc:
             current_minute_start = current_datetime_utc.replace(second=0,
                                                                 microsecond=0)
 
@@ -427,6 +413,7 @@ async def main():
                     candle_ts_utc_start = candle["timestamp"].replace(
                         second=0, microsecond=0)
 
+                    # Process only if the candle timestamp is for a past minute
                     if candle_ts_utc_start < current_minute_start:
                         logging.info(
                             f"1-Minute Candle CLOSED for {symbol}: "
@@ -449,21 +436,33 @@ async def main():
                             execute_trade(symbol, signal,
                                           current_price_for_trade)
 
-                            # Simple exit for the day after a trade is placed (optional, for testing)
-                            # You would remove this in a real system where you manage multiple trades.
-                            # For simplicity, if we place an order, let's assume we are done for this simulation.
-                            # This is just to prevent rapid-fire orders in a simple test.
-                            # break # Uncomment this line if you want to exit after the first trade.
-
                 last_minute_checked = current_minute_start
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.5
+                                )  # Poll more frequently within market hours
 
-    else:
-        logging.error(
-            "No access token available. Please run `python3 -m fyers_api.auth` to generate it first."
-        )
+        elif current_time_utc >= market_close_time_utc:
+            logging.info(
+                f"Market close time ({market_close_time_utc.strftime('%H:%M')} UTC) reached. Exiting system."
+            )
+            # You might want to square off any open positions here before exiting.
+            if fyers_ws_client:
+                fyers_ws_client.close(
+                )  # Explicitly close WebSocket connection
+            break  # Exit the loop and end the program after market close
 
+        else:  # Before market open
+            logging.info(
+                f"Market not yet open. Current UTC time: {current_time_utc.strftime('%H:%M:%S')}. Waiting for market open (UTC {market_open_time_utc.strftime('%H:%M')})."
+            )
+            await asyncio.sleep(60)  # Sleep longer if market is closed
+
+
+# This part is removed as the token check is now robust inside main()
+# else:
+#     logging.error(
+#         "No access token available. Please run `python3 -m fyers_api.auth` to generate it first."
+#     )
 
 if __name__ == "__main__":
     asyncio.run(main())
